@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -21,69 +22,103 @@
 
 #define MAX_LINE 1024
 
-typedef struct data_struct
+typedef struct data
 {
     DIR *dir;
     struct dirent *dirp;
+    blkcnt_t dir_total;
+} data;
 
+typedef struct start_args
+{
+    data *data;
     char **files;
+    bool work_done;
     int n_threads;
     int n_files;
     int c_files;
-} data_struct;
+    int c_dir;
+} start_args;
 
 /* ----- Function declaration -----*/
-void *init_struct(void);
-void check_data_struct(int argc, char *argv[], data_struct *s);
+void *init_sa_struct(void);
+void *init_data_struct(start_args *s);
+void check_start_args(int argc, char *argv[], start_args *s);
 
-void start_threads(pthread_t threads[], data_struct *s);
-void join_threads(pthread_t thread[], data_struct *s);
+void safe_thread(pthread_t thread, start_args *s);
+void join_threads(pthread_t thread[], start_args *s);
 void *thread_func(void *arg);
 
-void *safe_calloc(size_t size);
-void realloc_buff(char ***buffer, data_struct *s);
-void safe_exit(data_struct *s);
+void *safe_calloc(int amount, size_t size);
+void realloc_buff(char ***buffer, start_args *s);
+void safe_exit(start_args *s);
 
 int main(int argc, char *argv[])
 {
-    /* Initialize data_struct struct */
-    data_struct *ds = init_struct();
+    /* Initialize start_args struct */
+    start_args *sa = init_sa_struct();
 
     /* Check start arguments */
-    check_data_struct(argc, argv, ds);
+    check_start_args(argc, argv, sa);
+
+    /* Initialize structs for data */
+    sa->data = init_data_struct(sa);
 
     /* Create threads */
-    pthread_t thread[ds->n_threads];
+    pthread_t thread[sa->n_threads];
 
-    start_threads(thread, ds);
+    for (int i = 0; i < sa->n_threads; i++)
+    {
+        safe_thread(thread[i], sa);
+    }
 
-    join_threads(thread, ds);
+    // join_threads(thread, sa);
 
-    safe_exit(ds);
+    safe_exit(sa);
 }
 
 /* ----- Functions -----*/
 
 /**
- * @brief Initialize a struct
+ * @brief Initialize start_args struct
  *
  * @return void* pointer to allocated memory
  */
-void *init_struct(void)
+void *init_sa_struct(void)
 {
     /* Allocate memory for struct */
-    data_struct *ds;
-    ds = safe_calloc(sizeof(data_struct));
+    start_args *s;
+    s = safe_calloc(1, sizeof(start_args));
 
     /* Initialize values */
-    ds->n_threads = 1;
-    ds->n_files = 50;
-    ds->c_files = 0;
+    s->work_done = false;
+    s->n_threads = 1;
+    s->n_files = 50;
+    s->c_files = 0;
+    s->c_dir = 0;
 
     /* Allocate memory for buffers */
-    ds->files = safe_calloc(sizeof(char *) * ds->n_files);
+    s->files = safe_calloc(s->n_files, sizeof(char *));
 
-    return ds;
+    return s;
+}
+
+/**
+ * @brief Initialize data struct
+ *
+ * @param s start_args struct
+ * @return void* pointer to allocated memory
+ */
+void *init_data_struct(start_args *s)
+{
+    /* Allocate memory */
+    data *d;
+    d = safe_calloc(s->c_files, sizeof(data));
+
+    /* Set initial value for dir_total to 0 */
+    d->dir_total = 0;
+
+    return d;
 }
 
 /**
@@ -91,9 +126,9 @@ void *init_struct(void)
  *
  * @param argc      argc
  * @param argv      argv
- * @param s         data_struct struct
+ * @param s         start_args struct
  */
-void check_data_struct(int argc, char *argv[], data_struct *s)
+void check_start_args(int argc, char *argv[], start_args *s)
 {
     int flag;
 
@@ -116,41 +151,39 @@ void check_data_struct(int argc, char *argv[], data_struct *s)
         {
             realloc_buff(&s->files, s);
         }
-        s->files[s->c_files] = safe_calloc(sizeof(char) * MAX_LINE);
+        s->files[s->c_files] = safe_calloc(MAX_LINE, sizeof(char));
         strcpy(s->files[s->c_files], argv[optind]);
         s->c_files++;
     }
 }
 
-void start_threads(pthread_t thread[], data_struct *s)
+void safe_thread(pthread_t thread, start_args *s)
 {
-    for (int i = 0; i < s->n_threads; i++)
+    if (pthread_create(&thread, NULL, thread_func, s) != 0)
     {
-        pthread_create(&thread[i], NULL, thread_func, s);
+        perror(strerror(errno));
     }
 }
 
-void join_threads(pthread_t thread[], data_struct *s)
+void join_threads(pthread_t thread[], start_args *s)
 {
     for (int i = 0; i < s->n_threads; i++)
     {
-        pthread_join(thread[i], NULL);
+        if (pthread_join(thread[i], NULL) != 0)
+        {
+            perror(strerror(errno));
+        }
     }
 }
 
 void *thread_func(void *arg)
 {
-    data_struct *s = (data_struct *)arg;
-    struct stat stat_file;
+    start_args *s = (start_args *)arg;
 
-    s->dir = opendir(s->files[0]);
-
-    if (s->dir == NULL && errno == ENOTDIR)
-    {
-        lstat(s->files[0], &stat_file);
-        printf("%ld %s", stat_file.st_blocks, s->files[0]);
-    }
-
+    while ()
+        while ((s->data[] = readdir(d->dir)) != NULL)
+        {
+        }
     return 0;
 }
 
@@ -160,11 +193,11 @@ void *thread_func(void *arg)
  * @param size      size of memory to be allocated
  * @return void*    pointer to allocated memory
  */
-void *safe_calloc(size_t size)
+void *safe_calloc(int amount, size_t size)
 {
     void *mem_block;
 
-    if ((mem_block = calloc(1, size)) == NULL)
+    if ((mem_block = calloc(amount, size)) == NULL)
     {
         perror(strerror(errno));
         exit(errno);
@@ -177,9 +210,9 @@ void *safe_calloc(size_t size)
  * @brief Reallocate **char buffer.
  *
  * @param buffer  	Pointer to **char buffer.
- * @param s			data_struct struct.
+ * @param s			start_args struct.
  */
-void realloc_buff(char ***buffer, data_struct *s)
+void realloc_buff(char ***buffer, start_args *s)
 {
     char **temp;
 
@@ -214,7 +247,7 @@ void realloc_buff(char ***buffer, data_struct *s)
  *
  * @param s struct containing start arguments
  */
-void safe_exit(data_struct *s)
+void safe_exit(start_args *s)
 {
     for (int i = 0; i < s->c_files; i++)
     {
