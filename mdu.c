@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <dirent.h>
 #include <errno.h>
 
@@ -25,7 +26,6 @@
 typedef struct data
 {
     DIR *dir;
-    struct dirent *dirp;
     blkcnt_t dir_total;
 } data;
 
@@ -33,22 +33,24 @@ typedef struct start_args
 {
     data *data;
     char **files;
-    bool work_done;
     int n_threads;
     int n_files;
     int c_files;
-    int c_dir;
+    int done_cond;
 } start_args;
+
+pthread_mutex_t lock1, lock2, lock3, lock4 = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 
 /* ----- Function declaration -----*/
 void *init_sa_struct(void);
 void *init_data_struct(start_args *s);
 void check_start_args(int argc, char *argv[], start_args *s);
 
-void safe_thread(pthread_t thread, start_args *s);
+void safe_threads(pthread_t thread[], start_args *s);
 void join_threads(pthread_t thread[], start_args *s);
 void *thread_func(void *arg);
-
+bool check_mutex_cond(void);
 void *safe_calloc(int amount, size_t size);
 void realloc_buff(char ***buffer, start_args *s);
 void safe_exit(start_args *s);
@@ -67,12 +69,19 @@ int main(int argc, char *argv[])
     /* Create threads */
     pthread_t thread[sa->n_threads];
 
-    for (int i = 0; i < sa->n_threads; i++)
+    safe_threads(thread, sa);
+
+    while (sa->done_cond < sa->c_files)
     {
-        safe_thread(thread[i], sa);
+        pthread_mutex_lock(&lock4);
+        if (sa->done_cond == sa->n_threads)
+        {
+            pthread_cond_broadcast(&cond);
+        }
+        pthread_mutex_unlock(&lock4);
     }
 
-    // join_threads(thread, sa);
+    join_threads(thread, sa);
 
     safe_exit(sa);
 }
@@ -91,11 +100,10 @@ void *init_sa_struct(void)
     s = safe_calloc(1, sizeof(start_args));
 
     /* Initialize values */
-    s->work_done = false;
     s->n_threads = 1;
     s->n_files = 50;
     s->c_files = 0;
-    s->c_dir = 0;
+    s->done_cond = 0;
 
     /* Allocate memory for buffers */
     s->files = safe_calloc(s->n_files, sizeof(char *));
@@ -157,11 +165,14 @@ void check_start_args(int argc, char *argv[], start_args *s)
     }
 }
 
-void safe_thread(pthread_t thread, start_args *s)
+void safe_threads(pthread_t thread[], start_args *s)
 {
-    if (pthread_create(&thread, NULL, thread_func, s) != 0)
+    for (int i = 0; i < s->n_threads; i++)
     {
-        perror(strerror(errno));
+        if (pthread_create(&thread[i], NULL, thread_func, s) != 0)
+        {
+            perror(strerror(errno));
+        }
     }
 }
 
@@ -176,15 +187,69 @@ void join_threads(pthread_t thread[], start_args *s)
     }
 }
 
+/**
+ * @brief
+ *
+ * @param arg
+ * @return void*
+ */
 void *thread_func(void *arg)
 {
     start_args *s = (start_args *)arg;
+    struct dirent *ent_dir;
 
-    while ()
-        while ((s->data[] = readdir(d->dir)) != NULL)
+    /* Lock to avoid thread racing */
+    while (!check_mutex_cond())
+    {
+        pthread_mutex_lock(&lock1);
+        while ((ent_dir = readdir(s->data[s->done_cond].dir)) != NULL)
         {
+            pthread_mutex_unlock(&lock1);
+
+            if (ent_dir->d_type == DT_LNK)
+            {
+                continue;
+            }
+            else
+            {
+                /*
+                 * Create stat struct to save info about file/dir
+                 * Add amount of allocated 512B blocks allocated
+                 * to the total of the current directory
+                 */
+                struct stat tar_stat;
+                lstat(ent_dir->d_name, &tar_stat);
+
+                /* Lock to avoid thread racing */
+                pthread_mutex_lock(&lock2);
+                s->data[s->done_cond].dir_total += tar_stat.st_blocks;
+                pthread_mutex_unlock(&lock2);
+            }
         }
+        pthread_mutex_lock(&lock4);
+        s->done_cond++;
+        pthread_mutex_lock(&lock4);
+    }
+
     return 0;
+}
+
+bool check_mutex_cond(void)
+{
+    struct timeval curr_time;
+    struct timespec TTW;
+
+    gettimeofday(&curr_time, NULL);
+    TTW.tv_sec = curr_time.tv_sec + 1;
+    TTW.tv_nsec = (curr_time.tv_usec + 1000 * 1000) * 1000;
+
+    pthread_mutex_lock(&lock4);
+    if (pthread_cond_timedwait(&cond, &lock4, &TTW) == ETIMEDOUT)
+    {
+        pthread_mutex_unlock(&lock4);
+        return false;
+    }
+    return true;
 }
 
 /**
