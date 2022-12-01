@@ -3,15 +3,17 @@
  * @author Vincent Johansson (dv14vjn@cs.umu.se)
  * @brief
  * @version 0.1
- * @date 2022-10-31
+ * @date 2022-11-23
  *
  * @copyright Copyright (c) 2022
  *
  */
 
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <unistd.h>
@@ -20,40 +22,43 @@
 #include <sys/time.h>
 #include <dirent.h>
 #include <errno.h>
+#include "stack.h"
 
 #define MAX_LINE 1024
 
 typedef struct data
 {
-    DIR *dir;
-    blkcnt_t dir_total;
+    long int dir_total;
 } data;
 
 typedef struct start_args
 {
-    data *data;
+    Stack **work_order;
+    data **data;
     char **files;
     int n_threads;
     int n_files;
     int c_files;
-    int done_cond;
 } start_args;
 
-pthread_mutex_t lock1, lock2, lock3, lock4 = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+sem_t lock[5];
 
 /* ----- Function declaration -----*/
 void *init_sa_struct(void);
-void *init_data_struct(start_args *s);
+void *init_data_structs(start_args *s);
+void init_sem(sem_t lock[]);
+void init_stacks(start_args *s);
+void init_stack(start_args *s);
 void check_start_args(int argc, char *argv[], start_args *s);
-
 void safe_threads(pthread_t thread[], start_args *s);
 void join_threads(pthread_t thread[], start_args *s);
-void *thread_func(void *arg);
-bool check_mutex_cond(void);
+void do_work(start_args *s, char *str, int count);
+bool new_dir(char *str);
+void *work_func(void *arg);
+void print_results(start_args *s);
 void *safe_calloc(int amount, size_t size);
 void realloc_buff(char ***buffer, start_args *s);
-void safe_exit(start_args *s);
+void safe_exit(start_args *s, sem_t lock[]);
 
 int main(int argc, char *argv[])
 {
@@ -63,27 +68,20 @@ int main(int argc, char *argv[])
     /* Check start arguments */
     check_start_args(argc, argv, sa);
 
-    /* Initialize structs for data */
-    sa->data = init_data_struct(sa);
+    /* Initialize structs for data and work_order stack */
+    sa->data = init_data_structs(sa);
+    init_stacks(sa);
 
-    /* Create threads */
-    pthread_t thread[sa->n_threads];
-
+    /* Create threads and initialize semaphores*/
+    pthread_t thread[sa->n_threads + 1];
+    init_sem(lock);
     safe_threads(thread, sa);
 
-    while (sa->done_cond < sa->c_files)
-    {
-        pthread_mutex_lock(&lock4);
-        if (sa->done_cond == sa->n_threads)
-        {
-            pthread_cond_broadcast(&cond);
-        }
-        pthread_mutex_unlock(&lock4);
-    }
-
+    /* Wait for threads to finish then join threads and exit */
+    sem_wait(&lock[3]);
     join_threads(thread, sa);
-
-    safe_exit(sa);
+    print_results(sa);
+    safe_exit(sa, lock);
 }
 
 /* ----- Functions -----*/
@@ -103,7 +101,6 @@ void *init_sa_struct(void)
     s->n_threads = 1;
     s->n_files = 50;
     s->c_files = 0;
-    s->done_cond = 0;
 
     /* Allocate memory for buffers */
     s->files = safe_calloc(s->n_files, sizeof(char *));
@@ -117,16 +114,41 @@ void *init_sa_struct(void)
  * @param s start_args struct
  * @return void* pointer to allocated memory
  */
-void *init_data_struct(start_args *s)
+void *init_data_structs(start_args *s)
 {
     /* Allocate memory */
-    data *d;
-    d = safe_calloc(s->c_files, sizeof(data));
+    data **d;
+    d = safe_calloc(s->c_files, sizeof(data *));
 
-    /* Set initial value for dir_total to 0 */
-    d->dir_total = 0;
+    for (int i = 0; i < s->c_files; i++)
+    {
+        d[i] = safe_calloc(1, sizeof(data));
+        d[i]->dir_total = 0;
+    }
 
     return d;
+}
+
+void init_sem(sem_t lock[])
+{
+    /* Initialize variable locks */
+    for (int i = 0; i < 3; i++)
+    {
+        sem_init(&lock[i], 0, 1);
+    }
+
+    /* Semaphore to track if all threads are done working */
+    sem_init(&lock[3], 0, 0);
+}
+
+void init_stacks(start_args *s)
+{
+    s->work_order = safe_calloc(s->c_files, sizeof(Stack **));
+    for (int i = 0; i < s->c_files; i++)
+    {
+        s->work_order[i] = stack_create();
+        stack_push(s->work_order[i], s->files[i]);
+    }
 }
 
 /**
@@ -138,38 +160,49 @@ void *init_data_struct(start_args *s)
  */
 void check_start_args(int argc, char *argv[], start_args *s)
 {
-    int flag;
-
-    while ((flag = getopt(argc, argv, ":j:")) != -1)
+    /* If no dir/file has been specified then add current dir to s->files */
+    if (argc == 1)
     {
-        switch (flag)
-        {
-        case 'j':
-            s->n_threads = atoi(optarg);
-            break;
-        case '?':
-            fprintf(stderr, "usage: ./mdu [-j THREADS] {FILE/DIR} [FILES]\n");
-            exit(errno);
-        }
-    }
-
-    for (; optind < argc; optind++)
-    {
-        if (optind > s->n_files)
-        {
-            realloc_buff(&s->files, s);
-        }
-        s->files[s->c_files] = safe_calloc(MAX_LINE, sizeof(char));
-        strcpy(s->files[s->c_files], argv[optind]);
+        s->files[0] = safe_calloc(MAX_LINE, sizeof(char));
+        strcpy(s->files[0], "./");
         s->c_files++;
+    }
+    else
+    {
+        int flag;
+
+        while ((flag = getopt(argc, argv, ":j:")) != -1)
+        {
+            switch (flag)
+            {
+            case 'j':
+                s->n_threads = atoi(optarg);
+                break;
+            case '?':
+                fprintf(stderr, "usage: ./mdu [-j THREADS] {FILE/DIR} [FILES]\n");
+                exit(errno);
+            }
+        }
+
+        for (; optind < argc; optind++)
+        {
+            if (optind > s->n_files)
+            {
+                realloc_buff(&s->files, s);
+            }
+            s->files[s->c_files] = safe_calloc(MAX_LINE, sizeof(char));
+            strcpy(s->files[s->c_files], argv[optind]);
+            s->c_files++;
+        }
     }
 }
 
 void safe_threads(pthread_t thread[], start_args *s)
 {
+    /* Start work threads */
     for (int i = 0; i < s->n_threads; i++)
     {
-        if (pthread_create(&thread[i], NULL, thread_func, s) != 0)
+        if (pthread_create(&thread[i], NULL, work_func, s) != 0)
         {
             perror(strerror(errno));
         }
@@ -187,69 +220,99 @@ void join_threads(pthread_t thread[], start_args *s)
     }
 }
 
+void do_work(start_args *s, char *str, int count)
+{
+    struct dirent *ent_dir;
+    DIR *dir;
+    struct stat file_stat;
+    unsigned char type;
+    long int local_total = 0;
+    char *tmp_str;
+
+    if ((dir = opendir(str)) == NULL)
+    {
+        if (errno == ENOTDIR)
+        {
+            lstat(str, &file_stat);
+            local_total += file_stat.st_blocks;
+            sem_wait(&lock[2]);
+            s->data[count]->dir_total += local_total;
+            sem_post(&lock[2]);
+            return;
+        }
+        else if (errno == ENOENT)
+        {
+            return;
+        }
+        else
+        {
+            perror(strerror(errno));
+            return;
+        }
+    }
+
+    while ((ent_dir = readdir(dir)) != NULL)
+    {
+        type = ent_dir->d_type;
+        switch (type)
+        {
+        case DT_DIR:
+            tmp_str = safe_calloc(strlen(ent_dir->d_name) + 1, sizeof(char));
+            strcpy(tmp_str, ent_dir->d_name);
+            sem_wait(&lock[1]);
+            stack_push(s->work_order[count], tmp_str);
+            sem_post(&lock[1]);
+            free(tmp_str);
+            break;
+        case DT_REG:
+            lstat(ent_dir->d_name, &file_stat);
+            local_total += file_stat.st_blocks;
+            break;
+        }
+    }
+    sem_wait(&lock[2]);
+    s->data[count]->dir_total += local_total;
+    sem_post(&lock[2]);
+
+    closedir(dir);
+    return;
+}
+
 /**
  * @brief
  *
  * @param arg
  * @return void*
  */
-void *thread_func(void *arg)
+void *work_func(void *arg)
 {
     start_args *s = (start_args *)arg;
-    struct dirent *ent_dir;
 
-    /* Lock to avoid thread racing */
-    while (!check_mutex_cond())
+    char *current;
+
+    for (int i = 0; i < s->c_files; i++)
     {
-        pthread_mutex_lock(&lock1);
-        while ((ent_dir = readdir(s->data[s->done_cond].dir)) != NULL)
+        sem_wait(&lock[0]);
+        while (!stack_is_empty(s->work_order[i]))
         {
-            pthread_mutex_unlock(&lock1);
-
-            if (ent_dir->d_type == DT_LNK)
-            {
-                continue;
-            }
-            else
-            {
-                /*
-                 * Create stat struct to save info about file/dir
-                 * Add amount of allocated 512B blocks allocated
-                 * to the total of the current directory
-                 */
-                struct stat tar_stat;
-                lstat(ent_dir->d_name, &tar_stat);
-
-                /* Lock to avoid thread racing */
-                pthread_mutex_lock(&lock2);
-                s->data[s->done_cond].dir_total += tar_stat.st_blocks;
-                pthread_mutex_unlock(&lock2);
-            }
+            current = stack_pop(s->work_order[i]);
+            sem_post(&lock[0]);
+            do_work(s, current, i);
+            free(current); /* Free memory of used string */
+            sem_wait(&lock[0]);
         }
-        pthread_mutex_lock(&lock4);
-        s->done_cond++;
-        pthread_mutex_lock(&lock4);
+        sem_post(&lock[0]);
     }
-
+    sem_post(&lock[3]);
     return 0;
 }
 
-bool check_mutex_cond(void)
+void print_results(start_args *s)
 {
-    struct timeval curr_time;
-    struct timespec TTW;
-
-    gettimeofday(&curr_time, NULL);
-    TTW.tv_sec = curr_time.tv_sec + 1;
-    TTW.tv_nsec = (curr_time.tv_usec + 1000 * 1000) * 1000;
-
-    pthread_mutex_lock(&lock4);
-    if (pthread_cond_timedwait(&cond, &lock4, &TTW) == ETIMEDOUT)
+    for (int i = 0; i < s->c_files; i++)
     {
-        pthread_mutex_unlock(&lock4);
-        return false;
+        printf("%ld     %s\n", s->data[i]->dir_total, s->files[i]);
     }
-    return true;
 }
 
 /**
@@ -308,16 +371,27 @@ void realloc_buff(char ***buffer, start_args *s)
 }
 
 /**
- * @brief Used to free allocated memory before program exit
+ * @brief Free allocated memory and destroy semaphores before program exit
  *
  * @param s struct containing start arguments
  */
-void safe_exit(start_args *s)
+void safe_exit(start_args *s, sem_t lock[])
 {
+    /* Free memory */
     for (int i = 0; i < s->c_files; i++)
     {
+        stack_destroy(s->work_order[i]);
         free(s->files[i]);
+        free(s->data[i]);
     }
+    free(s->work_order);
     free(s->files);
+    free(s->data);
     free(s);
+
+    /* Destroy all semaphores */
+    for (int i = 0; i < 4; i++)
+    {
+        sem_destroy(&lock[i]);
+    }
 }
