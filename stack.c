@@ -35,7 +35,7 @@ void stack_push(Stack *s, char *str)
         perror(strerror(errno));
         exit(errno);
     }
-    new_data->data = malloc(sizeof(strlen(str) + 1));
+    new_data->data = malloc(strlen(str) + 1);
 
     /* Copy string and redirect pointers */
     strcpy(new_data->data, str);
@@ -44,16 +44,10 @@ void stack_push(Stack *s, char *str)
     s->size++;
 }
 
-/**
- * @brief Remove item from stack, user has to free memory
- *
- * @param s
- * @return char*
- */
 char *stack_pop(Stack *s)
 {
     /* Allocate temp memory for string and copy it */
-    char *tmp_string = malloc(sizeof(strlen(s->top->data) + 1));
+    char *tmp_string = malloc(strlen(s->top->data) + 1);
     strcpy(tmp_string, s->top->data);
 
     /* Redirect pointers */

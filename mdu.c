@@ -41,7 +41,7 @@ typedef struct start_args
     int c_files;
 } start_args;
 
-sem_t lock[5];
+sem_t lock[4];
 
 /* ----- Function declaration -----*/
 void *init_sa_struct(void);
@@ -73,7 +73,7 @@ int main(int argc, char *argv[])
     init_stacks(sa);
 
     /* Create threads and initialize semaphores*/
-    pthread_t thread[sa->n_threads + 1];
+    pthread_t thread[sa->n_threads];
     init_sem(lock);
     safe_threads(thread, sa);
 
@@ -164,7 +164,7 @@ void check_start_args(int argc, char *argv[], start_args *s)
     if (argc == 1)
     {
         s->files[0] = safe_calloc(MAX_LINE, sizeof(char));
-        strcpy(s->files[0], "./");
+        strcpy(s->files[0], ".");
         s->c_files++;
     }
     else
@@ -225,55 +225,61 @@ void do_work(start_args *s, char *str, int count)
     struct dirent *ent_dir;
     DIR *dir;
     struct stat file_stat;
-    unsigned char type;
     long int local_total = 0;
-    char *tmp_str;
+    char *pathbuf;
 
-    if ((dir = opendir(str)) == NULL)
+    if (lstat(str, &file_stat) < 0)
     {
-        if (errno == ENOTDIR)
+        perror(strerror(errno));
+    }
+
+    if (S_ISDIR(file_stat.st_mode))
+    {
+        local_total += file_stat.st_blocks;
+        if ((dir = opendir(str)) == NULL)
         {
-            lstat(str, &file_stat);
-            local_total += file_stat.st_blocks;
-            sem_wait(&lock[2]);
-            s->data[count]->dir_total += local_total;
-            sem_post(&lock[2]);
-            return;
-        }
-        else if (errno == ENOENT)
-        {
-            return;
-        }
-        else
-        {
+
             perror(strerror(errno));
             return;
         }
     }
+    else if (S_ISREG(file_stat.st_mode))
+    {
+        local_total += file_stat.st_blocks;
+        sem_wait(&lock[2]);
+        s->data[count]->dir_total += local_total;
+        sem_post(&lock[2]);
+        return;
+    }
 
     while ((ent_dir = readdir(dir)) != NULL)
     {
-        type = ent_dir->d_type;
-        switch (type)
+        if (!strcmp(ent_dir->d_name, ".") || !strcmp(ent_dir->d_name, ".."))
         {
-        case DT_DIR:
-            tmp_str = safe_calloc(strlen(ent_dir->d_name) + 1, sizeof(char));
-            strcpy(tmp_str, ent_dir->d_name);
+            continue;
+        }
+        pathbuf = safe_calloc(PATH_MAX, sizeof(char));
+        snprintf(pathbuf, PATH_MAX, "%s/%s", str, ent_dir->d_name);
+        if (lstat(pathbuf, &file_stat) < 0)
+        {
+            perror(strerror(errno));
+        }
+        switch (file_stat.st_mode & S_IFMT)
+        {
+        case S_IFDIR:
             sem_wait(&lock[1]);
-            stack_push(s->work_order[count], tmp_str);
+            stack_push(s->work_order[count], pathbuf);
             sem_post(&lock[1]);
-            free(tmp_str);
             break;
-        case DT_REG:
-            lstat(ent_dir->d_name, &file_stat);
-            local_total += file_stat.st_blocks;
+        case S_IFREG:
             break;
         }
+        free(pathbuf);
+        local_total += file_stat.st_blocks;
     }
     sem_wait(&lock[2]);
     s->data[count]->dir_total += local_total;
     sem_post(&lock[2]);
-
     closedir(dir);
     return;
 }
@@ -295,8 +301,10 @@ void *work_func(void *arg)
         sem_wait(&lock[0]);
         while (!stack_is_empty(s->work_order[i]))
         {
-            current = stack_pop(s->work_order[i]);
             sem_post(&lock[0]);
+            sem_wait(&lock[1]);
+            current = stack_pop(s->work_order[i]);
+            sem_post(&lock[1]);
             do_work(s, current, i);
             free(current); /* Free memory of used string */
             sem_wait(&lock[0]);
@@ -394,4 +402,6 @@ void safe_exit(start_args *s, sem_t lock[])
     {
         sem_destroy(&lock[i]);
     }
+
+    exit(errno);
 }
