@@ -39,24 +39,23 @@ typedef struct start_args
     int n_threads;
     int n_files;
     int c_files;
-    int done_threads;
     int thread_error;
 } start_args;
 
-pthread_mutex_t lock[3] = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t lock[4] = PTHREAD_MUTEX_INITIALIZER;
 
 /* ----- Function declaration -----*/
 void *init_sa_struct(void);
 void *init_data_structs(start_args *s);
 void init_stacks(start_args *s);
 void check_start_args(int argc, char *argv[], start_args *s);
-void init_locks(start_args *s, sem_t sem, pthread_mutex_t locks[]);
 void safe_threads(pthread_t thread[], start_args *s);
 void join_threads(pthread_t thread[], start_args *s);
 bool work_available(Stack *s);
 void do_work(start_args *s, char *str, int count);
 void *work_func(void *arg);
 void print_results(start_args *s);
+void error_handling(start_args *s, char *str, int mode);
 void *safe_calloc(int amount, size_t size);
 void realloc_buff(char ***buffer, start_args *s);
 void safe_exit(start_args *s, pthread_mutex_t locks[]);
@@ -129,6 +128,11 @@ void *init_data_structs(start_args *s)
     return d;
 }
 
+/**
+ * @brief Initializes the work_order stacks
+ *
+ * @param s start_args struct
+ */
 void init_stacks(start_args *s)
 {
     s->work_order = safe_calloc(s->c_files, sizeof(Stack **));
@@ -185,6 +189,12 @@ void check_start_args(int argc, char *argv[], start_args *s)
     }
 }
 
+/**
+ * @brief start threads safely
+ *
+ * @param thread array with all pthread_t
+ * @param s start_args struct
+ */
 void safe_threads(pthread_t thread[], start_args *s)
 {
     /* Start work threads */
@@ -197,6 +207,12 @@ void safe_threads(pthread_t thread[], start_args *s)
     }
 }
 
+/**
+ * @brief join all threads safely
+ *
+ * @param thread array with all pthread_t
+ * @param s start_args struct
+ */
 void join_threads(pthread_t thread[], start_args *s)
 {
     for (int i = 0; i < s->n_threads; i++)
@@ -208,6 +224,13 @@ void join_threads(pthread_t thread[], start_args *s)
     }
 }
 
+/**
+ * @brief checks for work in stack using mutex lock to avoid thread racing
+ *
+ * @param s start_args struct
+ * @return true if work available
+ * @return false if no work available
+ */
 bool work_available(Stack *s)
 {
     pthread_mutex_lock(&lock[0]);
@@ -220,30 +243,49 @@ bool work_available(Stack *s)
     return cond;
 }
 
+/**
+ * @brief handles all work collecting data from files and directories
+ *
+ * @param s start_args struct
+ * @param str name of file/dir to execute work on
+ * @param count integer specifying which given file is currently being worked on
+ */
 void do_work(start_args *s, char *str, int count)
 {
+    /* Local variables declaration */
     struct dirent *ent_dir;
     DIR *dir;
     struct stat file_stat;
     long int local_total = 0;
     char *pathbuf;
 
+    /* Get data of given file/dir and handle error */
     if (lstat(str, &file_stat) < 0)
     {
-        perror(strerror(errno));
-        pthread_mutex_lock(&lock[2]);
-        s->thread_error = errno;
-        pthread_mutex_unlock(&lock[2]);
+        error_handling(s, str, 0);
+        return;
     }
 
+    /*
+     * If directory, opendir for readdir usage
+     * If regular file, add block size to correct data struct
+     */
     if (S_ISDIR(file_stat.st_mode))
     {
+        /* Only add block size if given directory to avoid double addition if sub dir */
+        pthread_mutex_lock(&lock[3]);
+        for (int i = 0; i < s->c_files; i++)
+        {
+            if (!strcmp(str, s->files[i]))
+            {
+                local_total += file_stat.st_blocks;
+            }
+        }
+        pthread_mutex_unlock(&lock[3]);
+
         if ((dir = opendir(str)) == NULL)
         {
-            perror(strerror(errno));
-            pthread_mutex_lock(&lock[2]);
-            s->thread_error = errno;
-            pthread_mutex_unlock(&lock[2]);
+            error_handling(s, str, 1);
             return;
         }
     }
@@ -256,44 +298,49 @@ void do_work(start_args *s, char *str, int count)
         return;
     }
 
+    /* readdir until it returns NULL at end of directory */
     while ((ent_dir = readdir(dir)) != NULL)
     {
+        /* Skip links to parent dir */
         if (!strcmp(ent_dir->d_name, ".") || !strcmp(ent_dir->d_name, ".."))
         {
             continue;
         }
+
+        /* Save correct path in pathbuf for new file/dir */
         pathbuf = safe_calloc(PATH_MAX, sizeof(char));
         snprintf(pathbuf, PATH_MAX, "%s/%s", str, ent_dir->d_name);
 
         if (lstat(pathbuf, &file_stat) < 0)
         {
-            perror(strerror(errno));
-            pthread_mutex_lock(&lock[2]);
-            s->thread_error = errno;
-            pthread_mutex_unlock(&lock[2]);
+            error_handling(s, str, 0);
         }
-        switch (file_stat.st_mode & S_IFMT)
+
+        /* If directory, add to work_order stack */
+        if (S_ISDIR(file_stat.st_mode))
         {
-        case S_IFDIR:
             pthread_mutex_lock(&lock[0]);
             stack_push(s->work_order[count], pathbuf);
             pthread_mutex_unlock(&lock[0]);
-            break;
-        case S_IFREG:
-            break;
         }
+
+        /* Add block size to local_total and free pathbuf */
         local_total += file_stat.st_blocks;
         free(pathbuf);
     }
+
+    /* Add total from read dir to correct data struct */
     pthread_mutex_lock(&lock[1]);
     s->data[count]->dir_total += local_total;
     pthread_mutex_unlock(&lock[1]);
+
+    /* closedir and return */
     closedir(dir);
     return;
 }
 
 /**
- * @brief
+ * @brief Function used when starting threads
  *
  * @param arg
  * @return void*
@@ -303,6 +350,7 @@ void *work_func(void *arg)
     start_args *s = (start_args *)arg;
     char *current;
 
+    /* Loop through work_order stacks for all files and execute work */
     for (int i = 0; i < s->c_files; i++)
     {
         while (work_available(s->work_order[i]))
@@ -318,12 +366,48 @@ void *work_func(void *arg)
     return 0;
 }
 
+/**
+ * @brief Prints the results
+ *
+ * @param s start_args struct
+ */
 void print_results(start_args *s)
 {
     for (int i = 0; i < s->c_files; i++)
     {
         printf("%ld     %s\n", s->data[i]->dir_total, s->files[i]);
     }
+}
+
+/**
+ * @brief error handing in threads
+ *
+ * @param s start_args struct
+ * @param str name of current dir/file
+ * @param mode 0/1, used to specify if called after opendir
+ */
+void error_handling(start_args *s, char *str, int mode)
+{
+    if (mode == 1)
+    {
+        if (errno == EACCES)
+        {
+            /* Modified error message on EACCES that includes dir name */
+            fprintf(stderr, "mdu: cannot read directory '%s': Permission denied\n", str);
+        }
+        else
+        {
+            perror(strerror(errno));
+        }
+    }
+    else
+    {
+        perror(strerror(errno));
+    }
+
+    pthread_mutex_lock(&lock[2]);
+    s->thread_error = errno;
+    pthread_mutex_unlock(&lock[2]);
 }
 
 /**
@@ -382,13 +466,16 @@ void realloc_buff(char ***buffer, start_args *s)
 }
 
 /**
- * @brief Free allocated memory and destroy semaphores before program exit
+ * @brief Free allocated memory and destroy mutex locks before program exit
  *
  * @param s struct containing start arguments
+ * @param locks[] mutex locks to be destroyed
  */
 void safe_exit(start_args *s, pthread_mutex_t locks[])
 {
+    /* Save errno given by threads */
     int exit_no = s->thread_error;
+
     /* Free memory */
     for (int i = 0; i < s->c_files; i++)
     {
@@ -401,7 +488,7 @@ void safe_exit(start_args *s, pthread_mutex_t locks[])
     free(s->data);
     free(s);
 
-    /* Destroy semaphore and mutex */
+    /* Destroy mutex */
     for (int i = 0; i < 4; i++)
     {
         pthread_mutex_destroy(&locks[i]);
