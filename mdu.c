@@ -39,26 +39,27 @@ typedef struct start_args
     int n_threads;
     int n_files;
     int c_files;
+    int done_threads;
+    int thread_error;
 } start_args;
 
-sem_t lock[4];
+pthread_mutex_t lock[3] = PTHREAD_MUTEX_INITIALIZER;
 
 /* ----- Function declaration -----*/
 void *init_sa_struct(void);
 void *init_data_structs(start_args *s);
-void init_sem(sem_t lock[]);
 void init_stacks(start_args *s);
-void init_stack(start_args *s);
 void check_start_args(int argc, char *argv[], start_args *s);
+void init_locks(start_args *s, sem_t sem, pthread_mutex_t locks[]);
 void safe_threads(pthread_t thread[], start_args *s);
 void join_threads(pthread_t thread[], start_args *s);
+bool work_available(Stack *s);
 void do_work(start_args *s, char *str, int count);
-bool new_dir(char *str);
 void *work_func(void *arg);
 void print_results(start_args *s);
 void *safe_calloc(int amount, size_t size);
 void realloc_buff(char ***buffer, start_args *s);
-void safe_exit(start_args *s, sem_t lock[]);
+void safe_exit(start_args *s, pthread_mutex_t locks[]);
 
 int main(int argc, char *argv[])
 {
@@ -74,11 +75,9 @@ int main(int argc, char *argv[])
 
     /* Create threads and initialize semaphores*/
     pthread_t thread[sa->n_threads];
-    init_sem(lock);
     safe_threads(thread, sa);
 
     /* Wait for threads to finish then join threads and exit */
-    sem_wait(&lock[3]);
     join_threads(thread, sa);
     print_results(sa);
     safe_exit(sa, lock);
@@ -101,6 +100,7 @@ void *init_sa_struct(void)
     s->n_threads = 1;
     s->n_files = 50;
     s->c_files = 0;
+    s->thread_error = 0;
 
     /* Allocate memory for buffers */
     s->files = safe_calloc(s->n_files, sizeof(char *));
@@ -127,18 +127,6 @@ void *init_data_structs(start_args *s)
     }
 
     return d;
-}
-
-void init_sem(sem_t lock[])
-{
-    /* Initialize variable locks */
-    for (int i = 0; i < 3; i++)
-    {
-        sem_init(&lock[i], 0, 1);
-    }
-
-    /* Semaphore to track if all threads are done working */
-    sem_init(&lock[3], 0, 0);
 }
 
 void init_stacks(start_args *s)
@@ -220,6 +208,18 @@ void join_threads(pthread_t thread[], start_args *s)
     }
 }
 
+bool work_available(Stack *s)
+{
+    pthread_mutex_lock(&lock[0]);
+    bool cond = false;
+    if (!stack_is_empty(s))
+    {
+        cond = true;
+    }
+    pthread_mutex_unlock(&lock[0]);
+    return cond;
+}
+
 void do_work(start_args *s, char *str, int count)
 {
     struct dirent *ent_dir;
@@ -231,24 +231,28 @@ void do_work(start_args *s, char *str, int count)
     if (lstat(str, &file_stat) < 0)
     {
         perror(strerror(errno));
+        pthread_mutex_lock(&lock[2]);
+        s->thread_error = errno;
+        pthread_mutex_unlock(&lock[2]);
     }
 
     if (S_ISDIR(file_stat.st_mode))
     {
-        local_total += file_stat.st_blocks;
         if ((dir = opendir(str)) == NULL)
         {
-
             perror(strerror(errno));
+            pthread_mutex_lock(&lock[2]);
+            s->thread_error = errno;
+            pthread_mutex_unlock(&lock[2]);
             return;
         }
     }
     else if (S_ISREG(file_stat.st_mode))
     {
         local_total += file_stat.st_blocks;
-        sem_wait(&lock[2]);
+        pthread_mutex_lock(&lock[1]);
         s->data[count]->dir_total += local_total;
-        sem_post(&lock[2]);
+        pthread_mutex_unlock(&lock[1]);
         return;
     }
 
@@ -260,26 +264,30 @@ void do_work(start_args *s, char *str, int count)
         }
         pathbuf = safe_calloc(PATH_MAX, sizeof(char));
         snprintf(pathbuf, PATH_MAX, "%s/%s", str, ent_dir->d_name);
+
         if (lstat(pathbuf, &file_stat) < 0)
         {
             perror(strerror(errno));
+            pthread_mutex_lock(&lock[2]);
+            s->thread_error = errno;
+            pthread_mutex_unlock(&lock[2]);
         }
         switch (file_stat.st_mode & S_IFMT)
         {
         case S_IFDIR:
-            sem_wait(&lock[1]);
+            pthread_mutex_lock(&lock[0]);
             stack_push(s->work_order[count], pathbuf);
-            sem_post(&lock[1]);
+            pthread_mutex_unlock(&lock[0]);
             break;
         case S_IFREG:
             break;
         }
-        free(pathbuf);
         local_total += file_stat.st_blocks;
+        free(pathbuf);
     }
-    sem_wait(&lock[2]);
+    pthread_mutex_lock(&lock[1]);
     s->data[count]->dir_total += local_total;
-    sem_post(&lock[2]);
+    pthread_mutex_unlock(&lock[1]);
     closedir(dir);
     return;
 }
@@ -293,25 +301,20 @@ void do_work(start_args *s, char *str, int count)
 void *work_func(void *arg)
 {
     start_args *s = (start_args *)arg;
-
     char *current;
 
     for (int i = 0; i < s->c_files; i++)
     {
-        sem_wait(&lock[0]);
-        while (!stack_is_empty(s->work_order[i]))
+        while (work_available(s->work_order[i]))
         {
-            sem_post(&lock[0]);
-            sem_wait(&lock[1]);
+            pthread_mutex_lock(&lock[0]);
             current = stack_pop(s->work_order[i]);
-            sem_post(&lock[1]);
+            pthread_mutex_unlock(&lock[0]);
             do_work(s, current, i);
             free(current); /* Free memory of used string */
-            sem_wait(&lock[0]);
         }
-        sem_post(&lock[0]);
     }
-    sem_post(&lock[3]);
+
     return 0;
 }
 
@@ -383,8 +386,9 @@ void realloc_buff(char ***buffer, start_args *s)
  *
  * @param s struct containing start arguments
  */
-void safe_exit(start_args *s, sem_t lock[])
+void safe_exit(start_args *s, pthread_mutex_t locks[])
 {
+    int exit_no = s->thread_error;
     /* Free memory */
     for (int i = 0; i < s->c_files; i++)
     {
@@ -397,11 +401,11 @@ void safe_exit(start_args *s, sem_t lock[])
     free(s->data);
     free(s);
 
-    /* Destroy all semaphores */
+    /* Destroy semaphore and mutex */
     for (int i = 0; i < 4; i++)
     {
-        sem_destroy(&lock[i]);
+        pthread_mutex_destroy(&locks[i]);
     }
 
-    exit(errno);
+    exit(exit_no);
 }
