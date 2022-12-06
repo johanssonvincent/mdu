@@ -39,21 +39,25 @@ typedef struct start_args
     int n_threads;
     int n_files;
     int c_files;
+    int active_work;
     int thread_error;
 } start_args;
 
-pthread_mutex_t lock[4] = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t lock[5] = PTHREAD_MUTEX_INITIALIZER;
+static sem_t worker_cond, join_cond;
 
 /* ----- Function declaration -----*/
 void *init_sa_struct(void);
 void *init_data_structs(start_args *s);
 void init_stacks(start_args *s);
+void init_sem(void);
 void check_start_args(int argc, char *argv[], start_args *s);
 void safe_threads(pthread_t thread[], start_args *s);
 void join_threads(pthread_t thread[], start_args *s);
 bool work_available(Stack *s);
 void do_work(start_args *s, char *str, int count);
 void *work_func(void *arg);
+void *watcher_func(void *arg);
 void print_results(start_args *s);
 void error_handling(start_args *s, char *str, int mode);
 void *safe_calloc(int amount, size_t size);
@@ -74,9 +78,11 @@ int main(int argc, char *argv[])
 
     /* Create threads and initialize semaphores*/
     pthread_t thread[sa->n_threads];
+    init_sem();
     safe_threads(thread, sa);
 
     /* Wait for threads to finish then join threads and exit */
+    sem_wait(&join_cond);
     join_threads(thread, sa);
     print_results(sa);
     safe_exit(sa, lock);
@@ -141,6 +147,16 @@ void init_stacks(start_args *s)
         s->work_order[i] = stack_create();
         stack_push(s->work_order[i], s->files[i]);
     }
+}
+/**
+ * @brief Initialize semaphore
+ *
+ * @param s start_args struct
+ */
+void init_sem(void)
+{
+    sem_init(&worker_cond, 0, 1);
+    sem_init(&join_cond, 0, 0);
 }
 
 /**
@@ -360,6 +376,7 @@ void *work_func(void *arg)
             pthread_mutex_unlock(&lock[0]);
             do_work(s, current, i);
             free(current); /* Free memory of used string */
+            sem_wait(&worker_cond);
         }
     }
 
@@ -488,7 +505,9 @@ void safe_exit(start_args *s, pthread_mutex_t locks[])
     free(s->data);
     free(s);
 
-    /* Destroy mutex */
+    /* Destroy mutex & semaphore*/
+    sem_destroy(&worker_cond);
+    sem_destroy(&join_cond);
     for (int i = 0; i < 4; i++)
     {
         pthread_mutex_destroy(&locks[i]);
