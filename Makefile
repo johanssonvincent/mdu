@@ -5,3 +5,7 @@ OBJ = mdu.o stack.o
 
 mdu: $(OBJ)
 		$(CC) -o $@ $^ $(CFLAGS)
+
+.PHONY: clean
+clean:
+		-rm *.o mdu
