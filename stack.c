@@ -8,7 +8,7 @@ Stack *stack_create(void)
     Stack *s;
     if ((s = calloc(1, sizeof(Stack))) == NULL)
     {
-        perror(strerror(errno));
+        perror("malloc");
         exit(errno);
     }
     s->top = NULL;
@@ -32,10 +32,14 @@ void stack_push(Stack *s, char *str)
     stack_data *new_data;
     if ((new_data = malloc(sizeof(*new_data))) == NULL)
     {
-        perror(strerror(errno));
+        perror("malloc");
         exit(errno);
     }
-    new_data->data = malloc(strlen(str) + 1);
+    if ((new_data->data = malloc(sizeof(char) * strlen(str) + 1)) == NULL)
+    {
+        perror("malloc");
+        exit(errno);
+    }
 
     /* Copy string and redirect pointers */
     strcpy(new_data->data, str);
@@ -47,7 +51,12 @@ void stack_push(Stack *s, char *str)
 char *stack_pop(Stack *s)
 {
     /* Allocate temp memory for string and copy it */
-    char *tmp_string = malloc(strlen(s->top->data) + 1);
+    char *tmp_string;
+    if ((tmp_string = malloc(sizeof(char) * strlen(s->top->data) + 1)) == NULL)
+    {
+        perror("malloc");
+        exit(errno);
+    }
     strcpy(tmp_string, s->top->data);
 
     /* Redirect pointers */

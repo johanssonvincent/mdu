@@ -1,7 +1,7 @@
 /**
  * @file mdu.c
  * @author Vincent Johansson (dv14vjn@cs.umu.se)
- * @date 2023-01-14
+ * @date 2023-01-18
  *
  * @copyright Copyright (c) 2022
  *
@@ -36,31 +36,32 @@ typedef struct start_args
     data **data;
     char **files;
     sem_t **dir_cond;
+    pthread_mutex_t **locks;
     int n_threads;
     int n_files;
     int c_files;
     int thread_error;
 } start_args;
 
-pthread_mutex_t lock[4] = PTHREAD_MUTEX_INITIALIZER;
-
 /* ----- Function declaration -----*/
 void *init_sa_struct(void);
 void *init_data_structs(start_args *s);
 void init_stacks(start_args *s);
+void init_mutex(start_args *s);
 void init_sem(start_args *s);
 void check_start_args(int argc, char *argv[], start_args *s);
 void safe_threads(pthread_t thread[], start_args *s);
 void join_threads(pthread_t thread[], start_args *s);
-bool work_available(Stack *s);
-bool active_worker(start_args *s, int count);
+bool work_available(Stack *s, pthread_mutex_t *lock, char **str);
+bool active_worker(start_args *s, pthread_mutex_t *mutex, int count);
+void mark_active_work(int *active_workers, pthread_mutex_t *mutex, int value);
 void do_work(start_args *s, char *str, int count);
 void *work_func(void *arg);
 void print_results(start_args *s);
 void error_handling(start_args *s, char *str, int mode);
 void *safe_calloc(int amount, size_t size);
 void realloc_buff(char ***buffer, start_args *s);
-void safe_exit(start_args *s, pthread_mutex_t locks[]);
+void safe_exit(start_args *s);
 
 int main(int argc, char *argv[])
 {
@@ -71,18 +72,19 @@ int main(int argc, char *argv[])
     check_start_args(argc, argv, sa);
 
     /* Initialize structs for data and work_order stack */
+    init_mutex(sa);
+    init_sem(sa);
     sa->data = init_data_structs(sa);
     init_stacks(sa);
 
-    /* Create threads and initialize semaphores*/
+    /* Create threads */
     pthread_t thread[sa->n_threads];
-    init_sem(sa);
     safe_threads(thread, sa);
 
     /* Wait for threads to finish then join threads and exit */
     join_threads(thread, sa);
     print_results(sa);
-    safe_exit(sa, lock);
+    safe_exit(sa);
 }
 
 /* ----- Functions -----*/
@@ -148,13 +150,29 @@ void init_stacks(start_args *s)
 }
 
 /**
+ * @brief Initialize mutex locks
+ *
+ * @param s start_args struct
+ */
+void init_mutex(start_args *s)
+{
+    s->locks = safe_calloc(5, sizeof(pthread_mutex_t *));
+
+    for (int i = 0; i < 5; i++)
+    {
+        s->locks[i] = safe_calloc(1, sizeof(pthread_mutex_t));
+        pthread_mutex_init(s->locks[i], NULL);
+    }
+}
+
+/**
  * @brief Initialize semaphore
  *
  * @param s start_args struct
  */
 void init_sem(start_args *s)
 {
-    s->dir_cond = safe_calloc(1, sizeof(sem_t));
+    s->dir_cond = safe_calloc(s->c_files, sizeof(sem_t));
 
     for (int i = 0; i < s->c_files; i++)
     {
@@ -222,7 +240,7 @@ void safe_threads(pthread_t thread[], start_args *s)
     {
         if (pthread_create(&thread[i], NULL, work_func, s) != 0)
         {
-            perror(strerror(errno));
+            perror("pthread_create");
         }
     }
 }
@@ -239,7 +257,7 @@ void join_threads(pthread_t thread[], start_args *s)
     {
         if (pthread_join(thread[i], NULL) != 0)
         {
-            perror(strerror(errno));
+            perror("pthread_join");
         }
     }
 }
@@ -250,16 +268,17 @@ void join_threads(pthread_t thread[], start_args *s)
  * @param s start_args struct
  * @return true if work available otherwise false
  */
-bool work_available(Stack *s)
+bool work_available(Stack *s, pthread_mutex_t *mutex, char **str)
 {
-    pthread_mutex_lock(&lock[0]);
-    bool cond = false;
+    pthread_mutex_lock(mutex);
     if (!stack_is_empty(s))
     {
-        cond = true;
+        *str = stack_pop(s);
+        pthread_mutex_unlock(mutex);
+        return true;
     }
-    pthread_mutex_unlock(&lock[0]);
-    return cond;
+    pthread_mutex_unlock(mutex);
+    return false;
 }
 
 /**
@@ -269,16 +288,37 @@ bool work_available(Stack *s)
  * @param count integer specifying which given file/dir is currently being worked on
  * @return true if there are active workers otherwise false
  */
-bool active_worker(start_args *s, int count)
+bool active_worker(start_args *s, pthread_mutex_t *mutex, int count)
 {
-    pthread_mutex_lock(&lock[2]);
+    pthread_mutex_lock(mutex);
     bool cond = false;
     if (s->data[count]->active_work != 0)
     {
         cond = true;
     }
-    pthread_mutex_unlock(&lock[2]);
+    pthread_mutex_unlock(mutex);
     return cond;
+}
+
+/**
+ * @brief increase or decrease amount of active workers for a directory
+ *
+ * @param active_workers pointer to integer with amount of active workers
+ * @param mutex mutex lock
+ * @param value marks if increase or decrease, -1 to decrease or 1 to increase
+ */
+void mark_active_work(int *active_workers, pthread_mutex_t *mutex, int value)
+{
+    pthread_mutex_lock(mutex);
+    if (value > 0)
+    {
+        active_workers++;
+    }
+    else
+    {
+        active_workers--;
+    }
+    pthread_mutex_unlock(mutex);
 }
 
 /**
@@ -298,9 +338,7 @@ void do_work(start_args *s, char *str, int count)
     char *pathbuf;
 
     /* Mark that there's a thread working on the directory */
-    pthread_mutex_lock(&lock[2]);
-    s->data[count]->active_work++;
-    pthread_mutex_unlock(&lock[2]);
+    mark_active_work(&s->data[count]->active_work, s->locks[2], 1);
 
     /* Get data of given file/dir and handle error */
     if (lstat(str, &file_stat) < 0)
@@ -316,7 +354,7 @@ void do_work(start_args *s, char *str, int count)
     if (S_ISDIR(file_stat.st_mode))
     {
         /* Only add block size if given directory to avoid double addition if sub dir */
-        pthread_mutex_lock(&lock[3]);
+        pthread_mutex_lock(s->locks[3]);
         for (int i = 0; i < s->c_files; i++)
         {
             if (!strcmp(str, s->files[i]))
@@ -324,7 +362,7 @@ void do_work(start_args *s, char *str, int count)
                 local_total += file_stat.st_blocks;
             }
         }
-        pthread_mutex_unlock(&lock[3]);
+        pthread_mutex_unlock(s->locks[3]);
 
         if ((dir = opendir(str)) == NULL)
         {
@@ -335,13 +373,11 @@ void do_work(start_args *s, char *str, int count)
     else if (S_ISREG(file_stat.st_mode))
     {
         local_total += file_stat.st_blocks;
-        pthread_mutex_lock(&lock[1]);
+        pthread_mutex_lock(s->locks[1]);
         s->data[count]->dir_total += local_total;
-        pthread_mutex_unlock(&lock[1]);
+        pthread_mutex_unlock(s->locks[1]);
 
-        pthread_mutex_lock(&lock[2]);
-        s->data[count]->active_work--;
-        pthread_mutex_unlock(&lock[2]);
+        mark_active_work(&s->data[count]->active_work, s->locks[2], -1);
         return;
     }
 
@@ -366,9 +402,9 @@ void do_work(start_args *s, char *str, int count)
         /* If directory, add to work_order stack */
         if (S_ISDIR(file_stat.st_mode))
         {
-            pthread_mutex_lock(&lock[0]);
+            pthread_mutex_lock(s->locks[0]);
             stack_push(s->work_order[count], pathbuf);
-            pthread_mutex_unlock(&lock[0]);
+            pthread_mutex_unlock(s->locks[0]);
             sem_post(s->dir_cond[count]); /* Notify waiting threads there's work */
         }
 
@@ -378,15 +414,13 @@ void do_work(start_args *s, char *str, int count)
     }
 
     /* Add total from read dir to correct data struct */
-    pthread_mutex_lock(&lock[1]);
+    pthread_mutex_lock(s->locks[1]);
     s->data[count]->dir_total += local_total;
-    pthread_mutex_unlock(&lock[1]);
+    pthread_mutex_unlock(s->locks[1]);
 
     /* closedir, mark that work is finished */
     closedir(dir);
-    pthread_mutex_lock(&lock[2]);
-    s->data[count]->active_work--;
-    pthread_mutex_unlock(&lock[2]);
+    mark_active_work(&s->data[count]->active_work, s->locks[2], -1);
 }
 
 /**
@@ -403,15 +437,12 @@ void *work_func(void *arg)
     /* Loop through work_order stacks for all files and execute work */
     for (int i = 0; i < s->c_files; i++)
     {
-        while (work_available(s->work_order[i]))
+        while (work_available(s->work_order[i], s->locks[0], &current))
         {
-            pthread_mutex_lock(&lock[0]);
-            current = stack_pop(s->work_order[i]);
-            pthread_mutex_unlock(&lock[0]);
             do_work(s, current, i);
             free(current); /* Free memory of used string */
 
-            if (!work_available(s->work_order[i]) && active_worker(s, i))
+            if (active_worker(s, s->locks[2], i))
             {
                 sem_wait(s->dir_cond[i]);
             }
@@ -451,17 +482,17 @@ void error_handling(start_args *s, char *str, int mode)
         }
         else
         {
-            perror(strerror(errno));
+            perror"opendir");
         }
     }
     else
     {
-        perror(strerror(errno));
+        perror("error");
     }
 
-    pthread_mutex_lock(&lock[3]);
+    pthread_mutex_lock(s->locks[4]);
     s->thread_error = errno;
-    pthread_mutex_unlock(&lock[3]);
+    pthread_mutex_unlock(s->locks[4]);
 }
 
 /**
@@ -476,7 +507,7 @@ void *safe_calloc(int amount, size_t size)
 
     if ((mem_block = calloc(amount, size)) == NULL)
     {
-        perror(strerror(errno));
+        perror("calloc");
         exit(errno);
     }
 
@@ -498,7 +529,7 @@ void realloc_buff(char ***buffer, start_args *s)
     temp = realloc(*buffer, sizeof(char *) * s->n_files);
     if (temp == NULL)
     {
-        perror(strerror(errno));
+        perror("realloc");
         exit(errno);
     }
     *buffer = temp;
@@ -509,7 +540,7 @@ void realloc_buff(char ***buffer, start_args *s)
         temp2 = realloc(*buffer[i], sizeof(char) * MAX_LINE);
         if (temp2 == NULL)
         {
-            perror(strerror(errno));
+            perror("realloc");
             exit(errno);
         }
         else
@@ -525,10 +556,17 @@ void realloc_buff(char ***buffer, start_args *s)
  * @param s struct containing start arguments
  * @param locks[] mutex locks to be destroyed
  */
-void safe_exit(start_args *s, pthread_mutex_t locks[])
+void safe_exit(start_args *s)
 {
     /* Save errno given by threads */
     int exit_no = s->thread_error;
+
+    /* Destroy mutex */
+    for (int i = 0; i < 5; i++)
+    {
+        pthread_mutex_destroy(s->locks[i]);
+        free(s->locks[i]);
+    }
 
     /* Free memory & destroy semaphores */
     for (int i = 0; i < s->c_files; i++)
@@ -543,18 +581,8 @@ void safe_exit(start_args *s, pthread_mutex_t locks[])
     free(s->files);
     free(s->data);
     free(s->dir_cond);
+    free(s->locks);
     free(s);
 
-    /* Destroy mutex */
-    for (int i = 0; i < 4; i++)
-    {
-        pthread_mutex_destroy(&locks[i]);
-    }
-
-    /* If threads gave any error, exit with the given errno */
-    if (exit_no != 0)
-    {
-        exit(exit_no);
-    }
-    exit(EXIT_SUCCESS);
+    exit(exit_no);
 }
