@@ -482,7 +482,7 @@ void error_handling(start_args *s, char *str, int mode)
         }
         else
         {
-            perror"opendir");
+            perror("opendir");
         }
     }
     else
