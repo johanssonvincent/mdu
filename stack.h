@@ -86,8 +86,4 @@ char *stack_pop(Stack *s);
  */
 bool stack_is_empty(const Stack *s);
 
-char *copy_string(char *str);
-
-void *safe_calloc(int amount, size_t size);
-
 #endif /* STACK_H */
