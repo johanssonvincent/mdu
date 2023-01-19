@@ -1,4 +1,4 @@
-/*
+/**
  * @author  Vincent Johansson
  * @since   2021-01-03
  *
